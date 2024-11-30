@@ -1,0 +1,41 @@
+version: "3"
+
+services:
+  warp:
+    image: caomingjun/warp
+    container_name: warp-proxy
+    restart: always
+    ports:
+      - "1080:1080"
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ./warp-data:/var/lib/cloudflare-warp
+    networks:
+      - bot-network
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - warp
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # Adding proxy environment variables
+      - HTTPS_PROXY=socks5h://warp:1080
+      - HTTP_PROXY=socks5h://warp:1080
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge

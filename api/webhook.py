@@ -23,6 +23,13 @@ app = FastAPI(docs_url=None, redoc_url=None)
 # Load environment variables
 load_dotenv()
 
+# Configure proxy settings
+PROXY_URL = "socks5h://warp:1080"  # Changed from http to socks5h
+PROXIES = {
+    "http": PROXY_URL,
+    "https": PROXY_URL
+}
+
 # Configure Google AI
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -59,15 +66,23 @@ async def get_transcript_and_tutorial(url: str) -> str:
     """Fetch transcript and generate tutorial"""
     try:
         video_id = extract_video_id(url)
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        # Add debug logging
+        logger.info(f"Attempting to fetch transcript for video {video_id} using proxy {PROXY_URL}")
+        
+        transcript = YouTubeTranscriptApi.get_transcript(
+            video_id, 
+            proxies=PROXIES
+        )
+        
+        logger.info("Successfully fetched transcript")
         transcript_text = " ".join([entry['text'] for entry in transcript])
         
         chat_session = model.start_chat(history=[])
-        prompt = f"Create a comprehensive tutorial based on the provided transcript. Begin by analyzing the content of the transcript thoroughly to identify its core themes, key concepts, and main points. Break down the information into logical sections or chapters that flow in a structured and coherent manner. Ensure each section focuses on one main idea or topic to maintain clarity and engagement. Use simple and precise language to explain complex ideas. Start each section with an overview of the objectives and end with a summary or key takeaways. Include actionable steps or exercises after each topic to reinforce learning and provide practical applications. Conclude with a recap of the entire tutorial, highlighting the main points and encouraging readers to apply their newfound knowledge. Ensure the tutorial is easy to navigate by using subheadings and providing a logical progression of topics. Use plain formatting only. Transcript: {transcript_text}"
+        prompt = f"Create a comprehensive tutorial based on the provided transcript..."  # Your existing prompt
         response = chat_session.send_message(prompt)
-        
         return response.text
     except Exception as e:
+        logger.error(f"Error in get_transcript_and_tutorial: {str(e)}")
         return f"Error processing request! \n\n{str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
