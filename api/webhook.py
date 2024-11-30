@@ -8,9 +8,27 @@ from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 import json
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None)
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Incoming request: {request.method} {request.url}")
+    try:
+        response = await call_next(request)
+        logger.info(f"Response status: {response.status_code}")
+        return response
+    except Exception as e:
+        logger.error(f"Request failed: {str(e)}")
+        raise
 
 # Load environment variables
 load_dotenv()
@@ -96,13 +114,22 @@ application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).buil
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
+# Add a root route handler
+@app.get("/")
+async def root():
+    return {"status": "Bot webhook is running"}
+
 @app.post("/api/webhook")
 async def webhook(request: Request):
     """Handle incoming webhook requests from Telegram"""
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return Response(status_code=200)
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return Response(status_code=200)
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}")
+        return Response(status_code=200)  # Still return 200 to prevent Telegram from retrying
 
 @app.get("/api/webhook")
 async def webhook_info():
