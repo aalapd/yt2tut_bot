@@ -1,5 +1,6 @@
 # api/webhook.py
 import os
+import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
@@ -8,8 +9,8 @@ from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 import json
-import logging
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -18,17 +19,6 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
 app = FastAPI(docs_url=None, redoc_url=None)
-
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    logger.info(f"Incoming request: {request.method} {request.url}")
-    try:
-        response = await call_next(request)
-        logger.info(f"Response status: {response.status_code}")
-        return response
-    except Exception as e:
-        logger.error(f"Request failed: {str(e)}")
-        raise
 
 # Load environment variables
 load_dotenv()
@@ -49,6 +39,9 @@ model = genai.GenerativeModel(
     model_name="gemini-1.5-flash-8b",
     generation_config=generation_config,
 )
+
+# Initialize bot application at module level
+application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
 
 def extract_video_id(url: str) -> str:
     """Extract the video ID from a YouTube URL."""
@@ -109,29 +102,73 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as e:
         await status_message.edit_text(f"Error: {str(e)}")
 
-# Initialize the bot application
-application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+# Application initialization function
+async def initialize_application():
+    """Initialize the Telegram application"""
+    try:
+        await application.initialize()
+        await application.start()
+        
+        # Register handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+        
+        logger.info("Telegram application initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize application: {str(e)}")
+        raise
 
-# Add a root route handler
+# FastAPI startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the application on FastAPI startup"""
+    await initialize_application()
+
+# FastAPI shutdown event
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on FastAPI shutdown"""
+    await application.stop()
+    logger.info("Application shutdown complete")
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming HTTP requests"""
+    logger.info(f"Incoming request: {request.method} {request.url}")
+    try:
+        response = await call_next(request)
+        logger.info(f"Response status: {response.status_code}")
+        return response
+    except Exception as e:
+        logger.error(f"Request failed: {str(e)}")
+        raise
+
+# Health check endpoint
 @app.get("/")
 async def root():
+    """Root endpoint for health checking"""
     return {"status": "Bot webhook is running"}
 
+# Webhook endpoints
 @app.post("/api/webhook")
 async def webhook(request: Request):
     """Handle incoming webhook requests from Telegram"""
     try:
         data = await request.json()
+        logger.info("Received webhook data")
+        
         update = Update.de_json(data, application.bot)
         await application.process_update(update)
+        
+        logger.info("Successfully processed webhook update")
         return Response(status_code=200)
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}")
-        return Response(status_code=200)  # Still return 200 to prevent Telegram from retrying
+        # Return 200 even on error to prevent Telegram from retrying
+        return Response(status_code=200)
 
 @app.get("/api/webhook")
 async def webhook_info():
-    """Health check endpoint"""
+    """Health check endpoint for webhook"""
     return {"status": "ok"}
