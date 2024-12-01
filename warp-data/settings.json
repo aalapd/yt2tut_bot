@@ -1,6 +1,0 @@
-{
-  "version": 1,
-  "always_on": true,
-  "dns_log_until": null,
-  "qlog_logging": "disabled"
-}

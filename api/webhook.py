@@ -121,11 +121,8 @@ async def get_transcript_and_tutorial(url: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command"""
     welcome_message = (
-        "👋 Welcome! I create tutorials from YouTube videos.\n\n"
-        "Simply send me a YouTube URL, and I'll:\n"
-        "1. Extract the video transcript\n"
-        "2. Generate an actionable tutorial\n\n"
-        "Try it now by sending a YouTube URL!"
+        "👋 Hi there! I create tutorials from YouTube videos.\n\n"
+        "Simply send me a YouTube URL and I'll do the rest!"
     )
     await update.message.reply_text(welcome_message)
 
