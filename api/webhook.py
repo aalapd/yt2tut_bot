@@ -2,14 +2,15 @@ import os
 import logging
 import random
 import asyncio
+import google.generativeai as genai
 from typing import Optional, Dict, Any
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
+from .prompts import get_tutorial_prompt 
 
 # Configure logging
 logging.basicConfig(
@@ -116,10 +117,10 @@ async def get_transcript_and_tutorial(url: str) -> str:
         video_id = extract_video_id(url)
         max_retries = 10
         last_error = None
-
+        
         # Get proxy manager instance
         proxy_manager = await ProxyManager.get_instance()
-
+        
         # Try getting transcript with different proxies
         for attempt in range(max_retries):
             try:
@@ -131,16 +132,18 @@ async def get_transcript_and_tutorial(url: str) -> str:
                 break
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                logger.warning(f"Attempt {attempt + 1} failed: {last_error}")
                 if attempt == max_retries - 1:
-                    raise Exception(f"Failed to fetch transcript after {max_retries} attempts. Last error: {last_error}")
-
+                    raise Exception(f"Either this video does not have any captions or the video URL is incorrect.\n\nIf you're sure this video has captions, just try again later.")
+        
         chat_session = model.start_chat(history=[])
-        prompt = f"Create a comprehensive tutorial based on the provided transcript. Begin by analyzing the content of the transcript thoroughly to identify its core themes, key concepts, and main points. Break down the information into logical sections or chapters that flow in a structured and coherent manner. Ensure each section focuses on one main idea or topic to maintain clarity and engagement. Use simple and precise language to explain complex ideas. Start each section with an overview and end with a summary or key takeaways. Conclude with a recap of the entire tutorial, highlighting the main points and encouraging readers to apply their newfound knowledge. Include actionable steps or exercises at the end to reinforce learning and provide practical applications. Ensure the tutorial is easy to navigate by using subheadings and providing a logical progression of topics. Use plaintext formatting only. Do not format the headings or subheadings. Use plain numbered lists. Transcript: {transcript_text}"
+        # Use the prompt from the prompts module
+        prompt = get_tutorial_prompt(transcript_text)
         response = chat_session.send_message(prompt)
         return response.text
+        
     except Exception as e:
-        error_msg = f"Error processing request! \n\n{str(e)}"
+        error_msg = f"Oh no! This failed!! 🙈 \n\n{str(e)}"
         logger.error(error_msg)
         return error_msg
 
