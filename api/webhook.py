@@ -157,17 +157,48 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle URL messages"""
-    status_message = await update.message.reply_text("Processing your request... This may take a minute. 🐵")
     try:
-        url = update.message.text
-        tutorial = await get_transcript_and_tutorial(url)
-        max_length = 4000
-        chunks = [tutorial[i:i+max_length] for i in range(0, len(tutorial), max_length)]
-        await status_message.delete()
-        for chunk in chunks:
-            await update.message.reply_text(chunk)
-    except Exception as e:
-        await status_message.edit_text(f"Error: {str(e)}")
+        # Send status message first, outside of main processing
+        status_message = await update.message.reply_text(
+            "Processing your request... This may take a minute. 🐵"
+        )
+        
+        try:
+            # Process URL
+            url = update.message.text
+            tutorial = await get_transcript_and_tutorial(url)
+            
+            # Delete status message before sending response
+            try:
+                await status_message.delete()
+            except Exception as e:
+                logger.warning(f"Failed to delete status message: {e}")
+            
+            # Send tutorial in chunks
+            max_length = 4000
+            chunks = [tutorial[i:i+max_length] for i in range(0, len(tutorial), max_length)]
+            
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+                
+        except Exception as e:
+            # Handle processing errors
+            try:
+                await status_message.edit_text(f"Error: {str(e)}")
+            except Exception as edit_error:
+                # If status edit fails, send new message
+                logger.error(f"Failed to edit status message: {edit_error}")
+                await update.message.reply_text(f"Error: {str(e)}")
+                
+    except Exception as outer_e:
+        # Handle catastrophic errors
+        logger.error(f"Critical error in handle_url: {outer_e}")
+        try:
+            await update.message.reply_text(
+                "An unexpected error occurred. Please try again."
+            )
+        except Exception as final_e:
+            logger.error(f"Failed to send error message: {final_e}")
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
