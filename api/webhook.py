@@ -2,15 +2,16 @@ import os
 import logging
 import random
 import asyncio
-import google.generativeai as genai
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TelegramError
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
-from .prompts import get_tutorial_prompt 
+from .prompts import get_tutorial_prompt
+import google.generativeai as genai
 
 # Configure logging
 logging.basicConfig(
@@ -42,13 +43,35 @@ model = genai.GenerativeModel(
     generation_config=generation_config,
 )
 
+class UpdateTracker:
+    """Tracks processed updates to prevent duplicates."""
+    
+    def __init__(self, max_size: int = 1000):
+        self.processed_updates: Set[int] = set()
+        self.max_size = max_size
+        self.lock = asyncio.Lock()
+    
+    async def is_processed(self, update_id: int) -> bool:
+        """Check if update has been processed."""
+        async with self.lock:
+            return update_id in self.processed_updates
+    
+    async def mark_processed(self, update_id: int) -> None:
+        """Mark update as processed, maintaining max size."""
+        async with self.lock:
+            self.processed_updates.add(update_id)
+            if len(self.processed_updates) > self.max_size:
+                # Remove oldest entries
+                to_remove = len(self.processed_updates) - self.max_size
+                self.processed_updates = set(sorted(self.processed_updates)[to_remove:])
+
 class ProxyManager:
+    """Manages proxy rotation for YouTube requests."""
+    
     _instance: Optional['ProxyManager'] = None
     _lock = asyncio.Lock()
-    _proxies_lock = asyncio.Lock()  # Separate lock for proxy operations
-
+    
     def __init__(self, proxy_list: str):
-        """Initialize with comma-separated list of proxies"""
         self.proxies = []
         for proxy in proxy_list.split(','):
             try:
@@ -60,34 +83,64 @@ class ProxyManager:
             except Exception as e:
                 logger.error(f"Invalid proxy format: {proxy} - {str(e)}")
                 continue
-
+                
         if not self.proxies:
             raise ValueError("No valid proxies provided")
         logger.info(f"Initialized ProxyManager with {len(self.proxies)} proxies")
-
+    
     @classmethod
     async def get_instance(cls) -> 'ProxyManager':
-        """Get or create singleton instance"""
+        """Get or create singleton instance."""
         if not cls._instance:
             async with cls._lock:
                 if not cls._instance:
                     proxy_list = os.environ.get("PROXY_LIST", "")
                     cls._instance = cls(proxy_list)
         return cls._instance
-
+    
     async def get_random_proxy(self) -> Dict[str, str]:
-        """Thread-safe random proxy selection"""
-        async with self._proxies_lock:
-            return random.choice(self.proxies)
+        """Get random proxy with basic load balancing."""
+        return random.choice(self.proxies)
+
+class MessageManager:
+    """Manages Telegram message lifecycle."""
+    
+    def __init__(self):
+        self.status_messages = {}
+        self.lock = asyncio.Lock()
+    
+    async def send_status(self, chat_id: int, update: Update) -> None:
+        """Send status message and track it."""
+        try:
+            status = await update.message.reply_text(
+                "Processing your request... This may take a minute. 🐵"
+            )
+            async with self.lock:
+                self.status_messages[chat_id] = status
+        except Exception as e:
+            logger.error(f"Failed to send status message: {e}")
+    
+    async def cleanup_status(self, chat_id: int) -> None:
+        """Clean up status message."""
+        async with self.lock:
+            status = self.status_messages.pop(chat_id, None)
+            if status:
+                try:
+                    async with asyncio.timeout(3):
+                        await status.delete()
+                except Exception as e:
+                    logger.error(f"Failed to delete status message: {e}")
 
 class ApplicationManager:
+    """Manages Telegram application lifecycle."""
+    
     _instance: Optional[Application] = None
     _lock = asyncio.Lock()
     _initialized = False
-
+    
     @classmethod
     async def get_instance(cls) -> Application:
-        """Get or create singleton application instance"""
+        """Get or create singleton application instance."""
         if not cls._instance:
             async with cls._lock:
                 if not cls._instance:
@@ -99,8 +152,12 @@ class ApplicationManager:
                     cls._initialized = True
         return cls._instance
 
+# Initialize global instances
+update_tracker = UpdateTracker()
+message_manager = MessageManager()
+
 def extract_video_id(url: str) -> str:
-    """Extract the video ID from a YouTube URL."""
+    """Extract video ID from YouTube URL."""
     parsed_url = urlparse(url)
     if parsed_url.netloc == 'youtu.be':
         return parsed_url.path[1:]
@@ -112,16 +169,13 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Invalid YouTube URL. Please check and try again.")
 
 async def get_transcript_and_tutorial(url: str) -> str:
-    """Fetch transcript and generate tutorial"""
+    """Fetch transcript and generate tutorial with retries."""
     try:
         video_id = extract_video_id(url)
         max_retries = 10
-        last_error = None
-        
-        # Get proxy manager instance
         proxy_manager = await ProxyManager.get_instance()
         
-        # Try getting transcript with different proxies
+        # Try different proxies
         for attempt in range(max_retries):
             try:
                 proxy = await proxy_manager.get_random_proxy()
@@ -131,13 +185,15 @@ async def get_transcript_and_tutorial(url: str) -> str:
                 logger.info("Successfully fetched transcript")
                 break
             except Exception as e:
-                last_error = str(e)
-                logger.warning(f"Attempt {attempt + 1} failed: {last_error}")
+                logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
                 if attempt == max_retries - 1:
-                    raise Exception(f"Either this video does not have any captions or the video URL is incorrect.\n\nIf you're sure this video has captions, just try again later.")
+                    raise Exception(
+                        "Either this video does not have captions or the URL is incorrect.\n\n"
+                        "If you're sure this video has captions, please try again later."
+                    )
         
+        # Generate tutorial
         chat_session = model.start_chat(history=[])
-        # Use the prompt from the prompts module
         prompt = get_tutorial_prompt(transcript_text)
         response = chat_session.send_message(prompt)
         return response.text
@@ -148,7 +204,7 @@ async def get_transcript_and_tutorial(url: str) -> str:
         return error_msg
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command"""
+    """Handle /start command."""
     welcome_message = (
         "👋 Hi there! I create tutorials from YouTube videos.\n\n"
         "Simply send me a YouTube URL and I'll do the rest!"
@@ -156,50 +212,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(welcome_message)
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle URL messages"""
-    status_messages = []
+    """Handle URL messages with proper error handling."""
+    chat_id = update.message.chat_id
     
     try:
-        # Set message sending timeout
-        async with asyncio.timeout(5):
-            status = await update.message.reply_text(
-                "Processing your request... This may take a minute. 🐵"
-            )
-            status_messages.append(status)
+        # Send and track status message
+        await message_manager.send_status(chat_id, update)
         
+        # Process URL
         url = update.message.text
         tutorial = await get_transcript_and_tutorial(url)
         
-        # Clean up status messages
-        for msg in status_messages:
-            try:
-                async with asyncio.timeout(3):
-                    await msg.delete()
-            except Exception:
-                pass
+        # Clean up status message
+        await message_manager.cleanup_status(chat_id)
         
-        # Send tutorial
+        # Send tutorial in chunks
         max_length = 4000
         chunks = [tutorial[i:i+max_length] for i in range(0, len(tutorial), max_length)]
         for chunk in chunks:
             await update.message.reply_text(chunk)
             
-    except asyncio.TimeoutError:
-        logger.error("Timeout sending/deleting status message")
     except Exception as e:
         error_msg = f"Error: {str(e)}"
         logger.error(error_msg)
-        
-        if status_messages:
-            try:
-                async with asyncio.timeout(3):
-                    await status_messages[0].edit_text(error_msg)
-            except Exception:
-                await update.message.reply_text(error_msg)
+        try:
+            # Clean up status message
+            await message_manager.cleanup_status(chat_id)
+            # Send error message
+            await update.message.reply_text(error_msg)
+        except Exception as send_error:
+            logger.error(f"Failed to send error message: {send_error}")
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all incoming HTTP requests"""
+    """Log all incoming HTTP requests."""
     logger.info(f"Incoming request: {request.method} {request.url}")
     try:
         response = await call_next(request)
@@ -211,31 +257,44 @@ async def log_requests(request: Request, call_next):
 
 @app.post("/api/webhook")
 async def webhook(request: Request):
-    """Handle incoming webhook requests from Telegram"""
+    """Handle incoming webhook requests with deduplication."""
     try:
         data = await request.json()
         logger.info("Received webhook data")
-
-        # Get singleton application instance
+        
+        # Check for update_id
+        update_id = data.get('update_id')
+        if not update_id:
+            logger.warning("No update_id in webhook data")
+            return Response(status_code=200)
+        
+        # Check if already processed
+        if await update_tracker.is_processed(update_id):
+            logger.info(f"Skipping duplicate update {update_id}")
+            return Response(status_code=200)
+        
+        # Mark as processed
+        await update_tracker.mark_processed(update_id)
+        
+        # Process update
         application = await ApplicationManager.get_instance()
-
-        # Process the update
         update = Update.de_json(data, application.bot)
         await application.process_update(update)
         
         logger.info("Successfully processed webhook update")
         return Response(status_code=200)
+        
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}")
-        # Return 500 to allow Telegram to retry
-        return Response(status_code=500)
+        # Return 200 to prevent retries
+        return Response(status_code=200)
 
 @app.get("/api/webhook")
 async def webhook_info():
-    """Health check endpoint for webhook"""
+    """Health check endpoint for webhook."""
     return {"status": "ok"}
 
 @app.get("/")
 async def root():
-    """Root endpoint for health checking"""
+    """Root endpoint for health checking."""
     return {"status": "Bot webhook is running"}
