@@ -1,6 +1,8 @@
 import os
 import logging
 import random
+import asyncio
+from typing import Optional, Dict, Any
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
@@ -22,13 +24,6 @@ app = FastAPI(docs_url=None, redoc_url=None)
 # Load environment variables
 load_dotenv()
 
-# Configure proxy settings
-PROXY_URL = "socks5h://warp:1080"  # Changed from http to socks5h
-PROXIES = {
-    "http": PROXY_URL,
-    "https": PROXY_URL
-}
-
 # Configure Google AI
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -47,8 +42,12 @@ model = genai.GenerativeModel(
 )
 
 class ProxyManager:
+    _instance: Optional['ProxyManager'] = None
+    _lock = asyncio.Lock()
+    _proxies_lock = asyncio.Lock()  # Separate lock for proxy operations
+
     def __init__(self, proxy_list: str):
-        """Initialize with comma-separated list of proxies in format: ip:port:username:password"""
+        """Initialize with comma-separated list of proxies"""
         self.proxies = []
         for proxy in proxy_list.split(','):
             try:
@@ -60,31 +59,55 @@ class ProxyManager:
             except Exception as e:
                 logger.error(f"Invalid proxy format: {proxy} - {str(e)}")
                 continue
-                
+
         if not self.proxies:
             raise ValueError("No valid proxies provided")
         logger.info(f"Initialized ProxyManager with {len(self.proxies)} proxies")
 
-    def get_random_proxy(self):
-        """Get a random proxy from the list"""
-        return random.choice(self.proxies)
+    @classmethod
+    async def get_instance(cls) -> 'ProxyManager':
+        """Get or create singleton instance"""
+        if not cls._instance:
+            async with cls._lock:
+                if not cls._instance:
+                    proxy_list = os.environ.get("PROXY_LIST", "")
+                    cls._instance = cls(proxy_list)
+        return cls._instance
 
-# Initialize proxy manager
-proxy_manager = ProxyManager(os.environ.get("PROXY_LIST", ""))
+    async def get_random_proxy(self) -> Dict[str, str]:
+        """Thread-safe random proxy selection"""
+        async with self._proxies_lock:
+            return random.choice(self.proxies)
+
+class ApplicationManager:
+    _instance: Optional[Application] = None
+    _lock = asyncio.Lock()
+    _initialized = False
+
+    @classmethod
+    async def get_instance(cls) -> Application:
+        """Get or create singleton application instance"""
+        if not cls._instance:
+            async with cls._lock:
+                if not cls._instance:
+                    token = os.environ["TELEGRAM_BOT_TOKEN"]
+                    cls._instance = Application.builder().token(token).build()
+                    await cls._instance.initialize()
+                    cls._instance.add_handler(CommandHandler("start", start))
+                    cls._instance.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+                    cls._initialized = True
+        return cls._instance
 
 def extract_video_id(url: str) -> str:
     """Extract the video ID from a YouTube URL."""
     parsed_url = urlparse(url)
-    
     if parsed_url.netloc == 'youtu.be':
         return parsed_url.path[1:]
-    
     if parsed_url.netloc in ('youtube.com', 'www.youtube.com'):
         if parsed_url.path == '/watch':
             return parse_qs(parsed_url.query)['v'][0]
         elif parsed_url.path.startswith(('/embed/', '/v/')):
             return parsed_url.path.split('/')[2]
-    
     raise ValueError("Invalid YouTube URL. Please check and try again.")
 
 async def get_transcript_and_tutorial(url: str) -> str:
@@ -94,10 +117,13 @@ async def get_transcript_and_tutorial(url: str) -> str:
         max_retries = 10
         last_error = None
 
+        # Get proxy manager instance
+        proxy_manager = await ProxyManager.get_instance()
+
         # Try getting transcript with different proxies
         for attempt in range(max_retries):
             try:
-                proxy = proxy_manager.get_random_proxy()
+                proxy = await proxy_manager.get_random_proxy()
                 logger.info(f"Attempt {attempt + 1}: Using proxy {proxy['http']}")
                 transcript = YouTubeTranscriptApi.get_transcript(video_id, proxies=proxy)
                 transcript_text = " ".join([entry['text'] for entry in transcript])
@@ -108,9 +134,9 @@ async def get_transcript_and_tutorial(url: str) -> str:
                 logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
                 if attempt == max_retries - 1:
                     raise Exception(f"Failed to fetch transcript after {max_retries} attempts. Last error: {last_error}")
-        
+
         chat_session = model.start_chat(history=[])
-        prompt = f"Create a comprehensive tutorial based on the provided transcript. Begin by analyzing the content of the transcript thoroughly to identify its core themes, key concepts, and main points. Break down the information into logical sections or chapters that flow in a structured and coherent manner. Ensure each section focuses on one main idea or topic to maintain clarity and engagement. Use simple and precise language to explain complex ideas. Start each section with an overview of the objectives and end with a summary or key takeaways. Include actionable steps or exercises after each topic to reinforce learning and provide practical applications. Conclude with a recap of the entire tutorial, highlighting the main points and encouraging readers to apply their newfound knowledge. Ensure the tutorial is easy to navigate by using subheadings and providing a logical progression of topics. Use plaintext formatting only. Do not format the headings or subheadings. Use plain numbered lists. Transcript: {transcript_text}"
+        prompt = f"Create a comprehensive tutorial based on the provided transcript. Begin by analyzing the content of the transcript thoroughly to identify its core themes, key concepts, and main points. Break down the information into logical sections or chapters that flow in a structured and coherent manner. Ensure each section focuses on one main idea or topic to maintain clarity and engagement. Use simple and precise language to explain complex ideas. Start each section with an overview and end with a summary or key takeaways. Conclude with a recap of the entire tutorial, highlighting the main points and encouraging readers to apply their newfound knowledge. Include actionable steps or exercises at the end to reinforce learning and provide practical applications. Ensure the tutorial is easy to navigate by using subheadings and providing a logical progression of topics. Use plaintext formatting only. Do not format the headings or subheadings. Use plain numbered lists. Transcript: {transcript_text}"
         response = chat_session.send_message(prompt)
         return response.text
     except Exception as e:
@@ -129,36 +155,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle URL messages"""
     status_message = await update.message.reply_text("Processing your request... This may take a minute. 🐵")
-    
     try:
         url = update.message.text
         tutorial = await get_transcript_and_tutorial(url)
-        
         max_length = 4000
         chunks = [tutorial[i:i+max_length] for i in range(0, len(tutorial), max_length)]
-        
         await status_message.delete()
-        
         for chunk in chunks:
             await update.message.reply_text(chunk)
     except Exception as e:
         await status_message.edit_text(f"Error: {str(e)}")
-
-async def get_application():
-    """Get or create the Telegram application instance"""
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    
-    # Create new application instance
-    app = Application.builder().token(token).build()
-    
-    # Initialize the application
-    await app.initialize()
-    
-    # Add handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    
-    return app
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -178,10 +184,10 @@ async def webhook(request: Request):
     try:
         data = await request.json()
         logger.info("Received webhook data")
-        
-        # Get initialized application instance
-        application = await get_application()
-        
+
+        # Get singleton application instance
+        application = await ApplicationManager.get_instance()
+
         # Process the update
         update = Update.de_json(data, application.bot)
         await application.process_update(update)
@@ -190,7 +196,8 @@ async def webhook(request: Request):
         return Response(status_code=200)
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}")
-        return Response(status_code=200)
+        # Return 500 to allow Telegram to retry
+        return Response(status_code=500)
 
 @app.get("/api/webhook")
 async def webhook_info():
