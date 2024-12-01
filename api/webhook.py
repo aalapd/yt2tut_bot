@@ -1,6 +1,6 @@
-# api/webhook.py
 import os
 import logging
+import random
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
@@ -8,7 +8,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
-import json
 
 # Configure logging
 logging.basicConfig(
@@ -40,6 +39,32 @@ model = genai.GenerativeModel(
     generation_config=generation_config,
 )
 
+class ProxyManager:
+    def __init__(self, proxy_list: str):
+        """Initialize with comma-separated list of proxies in format: ip:port:username:password"""
+        self.proxies = []
+        for proxy in proxy_list.split(','):
+            try:
+                ip, port, username, password = proxy.strip().split(':')
+                self.proxies.append({
+                    'http': f'http://{username}:{password}@{ip}:{port}',
+                    'https': f'http://{username}:{password}@{ip}:{port}'
+                })
+            except Exception as e:
+                logger.error(f"Invalid proxy format: {proxy} - {str(e)}")
+                continue
+                
+        if not self.proxies:
+            raise ValueError("No valid proxies provided")
+        logger.info(f"Initialized ProxyManager with {len(self.proxies)} proxies")
+
+    def get_random_proxy(self):
+        """Get a random proxy from the list"""
+        return random.choice(self.proxies)
+
+# Initialize proxy manager
+proxy_manager = ProxyManager(os.environ.get("PROXY_LIST", ""))
+
 def extract_video_id(url: str) -> str:
     """Extract the video ID from a YouTube URL."""
     parsed_url = urlparse(url)
@@ -59,16 +84,33 @@ async def get_transcript_and_tutorial(url: str) -> str:
     """Fetch transcript and generate tutorial"""
     try:
         video_id = extract_video_id(url)
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        transcript_text = " ".join([entry['text'] for entry in transcript])
+        max_retries = 10
+        last_error = None
+
+        # Try getting transcript with different proxies
+        for attempt in range(max_retries):
+            try:
+                proxy = proxy_manager.get_random_proxy()
+                logger.info(f"Attempt {attempt + 1}: Using proxy {proxy['http']}")
+                transcript = YouTubeTranscriptApi.get_transcript(video_id, proxies=proxy)
+                transcript_text = " ".join([entry['text'] for entry in transcript])
+                logger.info("Successfully fetched transcript")
+                break
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise Exception(f"Failed to fetch transcript after {max_retries} attempts. Last error: {last_error}")
         
         chat_session = model.start_chat(history=[])
-        prompt = f"Create a comprehensive tutorial based on the provided transcript. Begin by analyzing the content of the transcript thoroughly to identify its core themes, key concepts, and main points. Break down the information into logical sections or chapters that flow in a structured and coherent manner. Ensure each section focuses on one main idea or topic to maintain clarity and engagement. Use simple and precise language to explain complex ideas. Start each section with an overview of the objectives and end with a summary or key takeaways. Include actionable steps or exercises after each topic to reinforce learning and provide practical applications. Conclude with a recap of the entire tutorial, highlighting the main points and encouraging readers to apply their newfound knowledge. Ensure the tutorial is easy to navigate by using subheadings and providing a logical progression of topics. Use plain formatting only. Transcript: {transcript_text}"
+        prompt = f"Create a comprehensive tutorial based on the provided transcript. Begin by analyzing the content of the transcript thoroughly to identify its core themes, key concepts, and main points. Break down the information into logical sections or chapters that flow in a structured and coherent manner. Ensure each section focuses on one main idea or topic to maintain clarity and engagement. Use simple and precise language to explain complex ideas. Start each section with an overview of the objectives and end with a summary or key takeaways. Include actionable steps or exercises after each topic to reinforce learning and provide practical applications. Conclude with a recap of the entire tutorial, highlighting the main points and encouraging readers to apply their newfound knowledge. Ensure the tutorial is easy to navigate by using subheadings and providing a logical progression of topics. Use plaintext formatting only. Do not format the headings or subheadings. Use plain numbered lists. Transcript: {transcript_text}"
         response = chat_session.send_message(prompt)
         
         return response.text
     except Exception as e:
-        return f"Error processing request! \n\n{str(e)}"
+        error_msg = f"Error processing request! \n\n{str(e)}"
+        logger.error(error_msg)
+        return error_msg
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command"""
@@ -99,7 +141,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as e:
         await status_message.edit_text(f"Error: {str(e)}")
 
-# Create a function to get or create the application
 async def get_application():
     """Get or create the Telegram application instance"""
     token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -116,7 +157,6 @@ async def get_application():
     
     return app
 
-# Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Log all incoming HTTP requests"""
@@ -129,7 +169,6 @@ async def log_requests(request: Request, call_next):
         logger.error(f"Request failed: {str(e)}")
         raise
 
-# Webhook endpoints
 @app.post("/api/webhook")
 async def webhook(request: Request):
     """Handle incoming webhook requests from Telegram"""
